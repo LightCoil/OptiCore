@@ -1,0 +1,984 @@
+# Все файлы проекта OptiCore
+
+Ниже приведено содержимое всех текстовых файлов проекта OptiCore, разделенных заголовками с указанием пути к файлу.
+
+## CMakeLists.txt
+```
+# CMakeLists.txt для OptiCore
+cmake_minimum_required(VERSION 3.10)
+project(OptiCore)
+set(CMAKE_CXX_STANDARD 17)
+
+# --- Qt5 ---
+find_package(Qt5 COMPONENTS Widgets Svg OpenGL REQUIRED)
+
+# --- ImGui ---
+find_path(IMGUI_INCLUDE_DIR imgui.h)
+find_library(IMGUI_LIB NAMES imgui)
+if(NOT IMGUI_INCLUDE_DIR OR NOT IMGUI_LIB)
+    message(FATAL_ERROR "Не найдена библиотека ImGui! Установите её через пакетный менеджер или соберите из исходников.")
+endif()
+
+# --- ALSA ---
+find_package(ALSA REQUIRED)
+
+# --- PulseAudio ---
+find_path(PULSEAUDIO_INCLUDE_DIR pulse/pulseaudio.h)
+find_library(PULSEAUDIO_LIB NAMES pulse)
+if(NOT PULSEAUDIO_INCLUDE_DIR OR NOT PULSEAUDIO_LIB)
+    message(FATAL_ERROR "Не найдена библиотека PulseAudio! Установите libpulse-dev (Debian/Ubuntu) или pulseaudio (Arch).")
+endif()
+
+# --- NVML (NVIDIA) ---
+find_path(NVML_INCLUDE_DIR nvml.h)
+find_library(NVML_LIB NAMES nvidia-ml)
+# Не критично, если нет NVML — просто не будет мониторинга NVIDIA
+if(NOT NVML_INCLUDE_DIR OR NOT NVML_LIB)
+    message(WARNING "NVML не найден: мониторинг NVIDIA GPU будет недоступен.")
+endif()
+
+# --- OpenGL ---
+find_package(OpenGL REQUIRED)
+
+# --- X11 ---
+find_package(X11 REQUIRED)
+
+# --- Исходники ---
+file(GLOB_RECURSIVE SRC
+    CPU/*.cpp
+    Memory/*.cpp
+    IO/*.cpp
+    Video/*.cpp
+    Audio/*.cpp
+    Power/*.cpp
+    UI/OptiCorePanel/*.cpp
+    plugins/*.cpp
+)
+
+include_directories(
+    ${IMGUI_INCLUDE_DIR}
+    ${PULSEAUDIO_INCLUDE_DIR}
+    ${NVML_INCLUDE_DIR}
+)
+
+add_executable(OptiCorePanel ${SRC})
+
+# Линковка библиотек
+set(LIBS
+    Qt5::Widgets Qt5::Svg Qt5::OpenGL
+    ${IMGUI_LIB}
+    ${ALSA_LIBRARIES}
+    ${PULSEAUDIO_LIB}
+    ${NVML_LIB}
+    ${OPENGL_LIBRARIES}
+    ${X11_LIBRARIES}
+)
+
+target_link_libraries(OptiCorePanel PRIVATE ${LIBS})
+
+# Для Qt5
+set_target_properties(OptiCorePanel PROPERTIES
+    AUTOMOC ON
+    AUTOUIC ON
+    AUTORCC ON
+)
+
+# Сообщение об успешной конфигурации
+message(STATUS "OptiCore готов к сборке! Все основные зависимости найдены.")
+```
+
+## README.md
+```
+# OptiCore — мультиплатформенный оптимизационный фреймворк
+
+## Сборка и запуск на Linux (antiX, Debian, Ubuntu, Arch)
+
+### 1. Установка зависимостей
+
+#### Для Debian/Ubuntu/antiX:
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git pkg-config libgl1-mesa-dev libx11-dev libxrandr-dev libxi-dev libasound2-dev libpulse-dev libnvidia-ml-dev qtbase5-dev qtbase5-dev-tools qtchooser qt5-qmake libqt5svg5-dev libqt5opengl5-dev
+# Для ImGui (если нет в репо):
+git clone https://github.com/ocornut/imgui.git
+cd imgui && make && sudo make install && cd ..
+# Для NVML (NVIDIA):
+sudo apt install -y libnvidia-ml-dev || echo 'NVML не найден, GPU-мониторинг NVIDIA будет недоступен'
+```
+
+#### Для Arch Linux:
+```bash
+sudo pacman -Syu --noconfirm
+sudo pacman -S --needed base-devel cmake git pkgconf mesa qt5-base alsa-lib pulseaudio nvidia-utils
+# ImGui (AUR):
+yay -S imgui
+```
+
+#### Добавление репозиториев (если что-то не находится):
+- **Debian/Ubuntu:**
+  - Для Qt5: `sudo add-apt-repository ppa:beineri/opt-qt-5.15.2-bionic -y && sudo apt update`
+  - Для PulseAudio: `sudo add-apt-repository ppa:ubuntu-audio-dev/ppa -y && sudo apt update`
+- **Arch:** используйте AUR (yay, paru) для ImGui, если нет в официальных.
+
+### 2. Клонирование репозитория OptiCore
+```bash
+git clone <URL_ВАШЕГО_РЕПОЗИТОРИЯ>
+cd Project\ Future
+```
+
+### 3. Сборка проекта
+```bash
+mkdir -p build
+cd build
+cmake ..
+make -j$(nproc)
+```
+
+### 4. Запуск OptiCorePanel
+```bash
+./OptiCorePanel
+```
+
+### 5. Примечания
+- Для управления governor, питания и некоторых функций может потребоваться запуск от root:
+  ```bash
+  sudo ./OptiCorePanel
+  ```
+- Для мониторинга NVIDIA GPU необходим установленный драйвер NVIDIA и библиотека NVML.
+- Для PulseAudio/ALSA — убедитесь, что демоны запущены.
+- Если что-то не находится — проверьте, что все репозитории добавлены и обновлены.
+
+### 6. Структура проекта
+- `CPU/`, `Memory/`, `IO/`, `Video/`, `Audio/`, `Power/` — оптимизаторы
+- `UI/OptiCorePanel/` — интерфейс ImGui
+- `plugins/` — интеграция модулей
+- `docs/` — документация
+
+### 7. Контакты и поддержка
+- Вопросы и баги — в Issues репозитория или на почту автора.
+
+---
+
+**OptiCore — NASA-grade оптимизация для вашего Linux!**
+
+## adapters/linux/platform_adapter_linux.cpp
+```
+#include "platform_adapter_linux.h"
+
+class PlatformAdapterLinux : public IPlatformAdapter {
+public:
+    bool SetCpuGovernor(const std::string& governor) override {
+        // TODO: Реальная реализация через sysfs
+        return true;
+    }
+    bool SetSwappiness(int value) override {
+        // TODO: echo value > /proc/sys/vm/swappiness
+        return true;
+    }
+    bool DropCaches() override {
+        // TODO: echo 3 > /proc/sys/vm/drop_caches
+        return true;
+    }
+    bool EnableHugePages(bool enable) override {
+        // TODO: echo N > /proc/sys/vm/nr_hugepages
+        return true;
+    }
+    bool SetIOScheduler(const std::string& device, const std::string& scheduler) override {
+        // TODO: echo scheduler > /sys/block/<device>/queue/scheduler
+        return true;
+    }
+    bool SetReadAhead(const std::string& device, int kb) override {
+        // TODO: echo kb > /sys/block/<device>/queue/read_ahead_kb
+        return true;
+    }
+    bool SetPowerProfile(const std::string& profile) override {
+        // TODO: управление профилями питания через systemd, upower, acpi
+        return true;
+    }
+    bool SetScreenOffTimeout(int seconds) override {
+        // TODO: настройка тайм-аута отключения экрана
+        return true;
+    }
+    bool SetGPUPerformanceLevel(const std::string& level) override {
+        // TODO: управление частотами/режимами GPU через sysfs, nvidia-smi, amdgpu
+        return true;
+    }
+    bool SetGPUPowerLimit(int percent) override {
+        // TODO: управление лимитом мощности GPU
+        return true;
+    }
+    bool SetGPUFanSpeed(int percent) override {
+        // TODO: управление скоростью вентилятора GPU
+        return true;
+    }
+    bool SetAudioBufferSize(int ms) override {
+        // TODO: настройка размера буфера ALSA/PulseAudio
+        return true;
+    }
+    bool SetAudioAsyncMode(bool enable) override {
+        // TODO: включение/отключение асинхронного режима вывода
+        return true;
+    }
+    bool SetAudioSampleRate(int hz) override {
+        // TODO: настройка sample rate ALSA/PulseAudio
+        return true;
+    }
+};
+```
+
+## CPU/profiler/performance_monitor.c
+```
+/* performance_monitor.c - Мониторинг производительности для Xbox 360 */
+/* Этот файл реализует функции профилирования и логирования для оптимизации */
+
+#include <stdint.h>
+
+/* Функция для чтения счетчиков производительности (PMC) */
+void read_performance_counters(uint32_t* counters, int count) {
+    // Чтение счетчиков производительности через специальные регистры
+    // PMC1 - SPR 771, PMC2 - SPR 772 и т.д. (пример для Xenon)
+    for (int i = 0; i < count; i++) {
+        counters[i] = read_spr(771 + i);
+    }
+}
+
+/* Функция для чтения временной базы (TBR) */
+uint64_t read_time_base() {
+    // Использование функции read_timebase из powerpc_utils
+    return read_timebase();
+}
+
+/* Функция для логирования горячих точек выполнения */
+void log_hotspots(uint32_t* counters, int count) {
+    // Логирование данных о производительности в выделенную память
+    // Здесь должна быть реализация записи в буфер или на диск
+    for (int i = 0; i < count; i++) {
+        // Пример логирования (заглушка)
+        // log_to_buffer("Counter %d: %u\n", i, counters[i]);
+    }
+}
+
+/* Функция для анализа узких мест */
+void analyze_bottlenecks(uint32_t* counters, int count) {
+    // Анализ данных счетчиков для выявления узких мест
+    // Здесь должна быть реализация анализа данных
+    for (int i = 0; i < count; i++) {
+        if (counters[i] > 1000000) { // Пример порога
+            // log_to_buffer("Bottleneck detected at counter %d: %u\n", i, counters[i]);
+        }
+    }
+}
+
+/* Инициализация профайлера */
+void init_profiler() {
+    // Инициализация счетчиков и буферов для логирования
+    // Здесь должна быть реализация настройки PMC и TBR
+}
+
+/* Запуск профилирования */
+void start_profiling() {
+    // Запуск мониторинга производительности
+    // Здесь должна быть реализация включения счетчиков
+}
+
+/* Остановка профилирования */
+void stop_profiling() {
+    // Остановка мониторинга и сбор данных
+    // Здесь должна быть реализация выключения счетчиков
+}
+```
+
+## CPU/profiler/load_predictor.h
+```
+#pragma once
+#include <stddef.h>
+#include <stdbool.h>
+
+typedef struct load_predictor load_predictor_t;
+
+void load_predictor_init(load_predictor_t* pred, size_t history_size);
+void load_predictor_add_sample(load_predictor_t* pred, float value);
+float load_predictor_autocorr(load_predictor_t* pred, size_t lag);
+float load_predictor_predict(load_predictor_t* pred);
+void load_predictor_destroy(load_predictor_t* pred);
+```
+
+## CPU/profiler/load_predictor.c
+```
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <math.h>
+
+// LoadPredictor: автокорреляционный анализ нагрузки
+
+typedef struct {
+    float* history;
+    size_t history_size;
+    size_t pos;
+    float last_prediction;
+} load_predictor_t;
+
+// Инициализация предиктора
+void load_predictor_init(load_predictor_t* pred, size_t history_size) {
+    pred->history = (float*)malloc(sizeof(float) * history_size);
+    pred->history_size = history_size;
+    pred->pos = 0;
+    pred->last_prediction = 0.0f;
+}
+
+// Добавить новую метрику нагрузки
+void load_predictor_add_sample(load_predictor_t* pred, float value) {
+    pred->history[pred->pos % pred->history_size] = value;
+    pred->pos++;
+}
+
+// Автокорреляционный прогноз
+float load_predictor_autocorr(load_predictor_t* pred, size_t lag) {
+    if (lag >= pred->history_size) return 0.0f;
+    float mean = 0.0f;
+    for (size_t i = 0; i < pred->history_size; ++i) mean += pred->history[i];
+    mean /= pred->history_size;
+    float num = 0.0f, denom = 0.0f;
+    for (size_t i = 0; i < pred->history_size - lag; ++i) {
+        num += (pred->history[i] - mean) * (pred->history[i + lag] - mean);
+    }
+    for (size_t i = 0; i < pred->history_size; ++i) {
+        denom += (pred->history[i] - mean) * (pred->history[i] - mean);
+    }
+    return denom ? num / denom : 0.0f;
+}
+
+// Прогноз следующей нагрузки
+float load_predictor_predict(load_predictor_t* pred) {
+    // Используем автокорреляцию с лагом 1
+    float corr = load_predictor_autocorr(pred, 1);
+    float last = pred->history[(pred->pos - 1) % pred->history_size];
+    pred->last_prediction = last * corr;
+    return pred->last_prediction;
+}
+
+// Освобождение ресурсов
+void load_predictor_destroy(load_predictor_t* pred) {
+    free(pred->history);
+    pred->history = NULL;
+    pred->history_size = 0;
+    pred->pos = 0;
+    pred->last_prediction = 0.0f;
+}
+```
+
+## CPU/microkernel/task_scheduler.c
+```
+/* task_scheduler.c - Планировщик задач для микроядра Xbox 360 */
+/* Этот файл реализует минималистичный планировщик для распределения задач между ядрами */
+
+#include <stdint.h>
+
+#define MAX_TASKS 64
+
+/* Структура для описания задачи */
+typedef struct {
+    void (*func)(void*);    /* Указатель на функцию задачи */
+    void *arg;              /* Аргументы для функции */
+    volatile int status;    /* Статус: 0 = новая, 1 = выполняется, 2 = завершена */
+} task_t;
+
+/* Очередь задач */
+task_t task_queue[MAX_TASKS];
+volatile int task_head = 0;  /* Индекс начала очереди */
+volatile int task_tail = 0;  /* Индекс конца очереди */
+
+/* Функция для добавления задачи в очередь (атомарная операция) */
+int enqueue_task(void (*func)(void*), void *arg) {
+    int old_tail;
+    int new_tail;
+    int reserved;
+    
+    do {
+        old_tail = task_tail;
+        if ((old_tail + 1) % MAX_TASKS == task_head) {
+            return -1; // Очередь полна
+        }
+        new_tail = (old_tail + 1) % MAX_TASKS;
+        
+        // Используем атомарные операции для безопасного обновления tail
+        // На PowerPC используем lwarx/stwcx. для реализации lock-free механизма
+        asm volatile (
+            "lwarx %0, 0, %2\n"
+            "cmpw %0, %3\n"
+            "bne- 1f\n"
+            "stwcx. %4, 0, %2\n"
+            "bne- 1f\n"
+            "li %1, 1\n"
+            "b 2f\n"
+            "1: li %1, 0\n"
+            "2:\n"
+            : "=r"(old_tail), "=r"(reserved)
+            : "r"(&task_tail), "r"(old_tail), "r"(new_tail)
+            : "memory", "cr0"
+        );
+    } while (!reserved);
+    
+    task_queue[old_tail].func = func;
+    task_queue[old_tail].arg = arg;
+    task_queue[old_tail].status = 0;
+    return 0;
+}
+
+/* Функция для получения следующей задачи из очереди (атомарная операция) */
+task_t* get_next_task_atomic() {
+    if (task_head == task_tail) {
+        return 0; // Очередь пуста
+    }
+    
+    // Используем атомарные операции для безопасного доступа к очереди
+    // На PowerPC используем lwarx/stwcx. для реализации lock-free механизма
+    uint32_t old_head;
+    asm volatile (
+        "lwarx %0, 0, %1\n"
+        : "=r"(old_head)
+        : "r"(&task_head)
+        : "memory"
+    );
+    
+    if (old_head == task_tail) {
+        return 0; // Очередь пуста
+    }
+    
+    task_t* task = &task_queue[old_head];
+    task->status = 1; // Помечаем как выполняющуюся
+    
+    uint32_t new_head = (old_head + 1) % MAX_TASKS;
+    uint32_t reserved;
+    asm volatile (
+        "stwcx. %2, 0, %1\n"
+        "bne- 1f\n"
+        "li %0, 1\n"
+        "b 2f\n"
+        "1: li %0, 0\n"
+        "2:\n"
+        : "=r"(reserved)
+        : "r"(&task_head), "r"(new_head)
+        : "memory", "cr0"
+    );
+    
+    if (reserved) {
+        return task;
+    } else {
+        return 0; // Не удалось обновить head, повторяем попытку
+    }
+}
+
+/* Цикл рабочего ядра для обработки задач */
+void worker_thread_loop(int id) {
+    while (1) {
+        task_t *task = get_next_task_atomic();
+        if (!task) {
+            continue; // Нет задач, продолжаем ожидание
+        }
+        task->func(task->arg); // Выполняем задачу
+        task->status = 2; // Помечаем как завершённую
+    }
+}
+
+/* Инициализация планировщика */
+void init_scheduler() {
+    task_head = 0;
+    task_tail = 0;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        task_queue[i].status = 2; // Все задачи изначально завершены
+    }
+}
+```
+
+## CPU/memory/mmu_manager.c
+```
+/* mmu_manager.c - Управление памятью и MMU для Xbox 360 */
+/* Этот файл реализует базовые функции для работы с таблицами страниц и памятью */
+
+#include <stdint.h>
+
+/* Функция для чтения текущих таблиц страниц Hypervisor */
+void read_hypervisor_page_table() {
+    // Чтение специальных регистров MMU, таких как SDR1 (Storage Description Register)
+    uint32_t sdr1 = read_spr(25); // SPR 25 - SDR1
+    // Здесь должна быть дальнейшая реализация для чтения и анализа таблиц страниц
+    // на основе значения SDR1
+}
+
+/* Функция для создания собственной таблицы страниц */
+void create_custom_page_table() {
+    // Создание новой таблицы страниц с расширенными правами (RWX)
+    // Использование существующей таблицы как шаблона
+    // Здесь должна быть дальнейшая реализация для настройки новой таблицы страниц
+    // и записи ее адреса в SDR1 через write_spr(25, new_table_address)
+}
+
+/* Функция для загрузки записи в TLB (Translation Lookaside Buffer) */
+void load_tlb_entry(uint32_t virtual_addr, uint32_t physical_addr, uint32_t permissions) {
+    // Использование функции write_tlb_entry из powerpc_utils
+    // Индекс TLB и атрибуты пока заданы как пример
+    write_tlb_entry(0, virtual_addr, physical_addr, permissions);
+}
+
+/* Функция для сброса всех TLB */
+void reset_tlb() {
+    // Использование функции invalidate_tlb из powerpc_utils
+    invalidate_tlb();
+}
+
+/* Функция для обеспечения кэш-когерентности */
+void ensure_cache_coherency() {
+    // Использование функции cache_coherency_sync из powerpc_utils
+    cache_coherency_sync();
+}
+
+/* Инициализация менеджера памяти */
+void init_mmu_manager() {
+    // Чтение текущих таблиц страниц Hypervisor
+    read_hypervisor_page_table();
+    
+    // Создание собственной таблицы страниц
+    create_custom_page_table();
+    
+    // Сброс TLB для применения изменений
+    reset_tlb();
+    
+    // Обеспечение кэш-когерентности
+    ensure_cache_coherency();
+}
+```
+
+## CPU/lowlevel/powerpc_utils.c
+```
+/* powerpc_utils.c - Утилиты для низкоуровневого доступа к PowerPC (Xenon) на Xbox 360 */
+/* Этот файл содержит функции для работы с регистрами и инструкциями PowerPC */
+
+#include <stdint.h>
+
+/* Функция для чтения значения из специального регистра (SPR) */
+uint32_t read_spr(uint32_t spr_num) {
+    uint32_t value;
+    asm volatile ("mfspr %0, %1" : "=r"(value) : "i"(spr_num));
+    return value;
+}
+
+/* Функция для записи значения в специальный регистр (SPR) */
+void write_spr(uint32_t spr_num, uint32_t value) {
+    asm volatile ("mtspr %0, %1" : : "i"(spr_num), "r"(value) : "memory");
+}
+
+/* Функция для чтения Machine State Register (MSR) */
+uint32_t read_msr() {
+    uint32_t value;
+    asm volatile ("mfmsr %0" : "=r"(value));
+    return value;
+}
+
+/* Функция для записи в Machine State Register (MSR) */
+void write_msr(uint32_t value) {
+    asm volatile ("mtmsr %0" : : "r"(value) : "memory");
+}
+
+/* Функция для отправки Inter-Processor Interrupt (IPI) */
+void send_ipi_to_core(uint32_t core_id, uint32_t vector) {
+    // Используется доступ к регистрам для отправки IPI
+    // Пример: запись в регистр IPI для указанного ядра (предполагаемый регистр SPR 1023 для Xenon)
+    uint32_t ipi_value = (1 << core_id) | (vector & 0xFF);
+    write_spr(1023, ipi_value); // SPR 1023 - предполагаемый регистр для IPI
+    cache_coherency_sync(); // Обеспечение когерентности после записи
+}
+
+/* Функция для чтения Time Base Register (TBR) */
+uint64_t read_timebase() {
+    uint32_t tbl, tbu;
+    asm volatile (
+        "mftb %0\n"
+        "mftbu %1\n"
+        : "=r"(tbl), "=r"(tbu)
+    );
+    return ((uint64_t)tbu << 32) | tbl;
+}
+
+/* Функция для сброса TLB (Translation Lookaside Buffer) */
+void invalidate_tlb() {
+    asm volatile ("tlbia" : : : "memory");
+}
+
+/* Функция для записи записи в TLB */
+void write_tlb_entry(uint32_t index, uint32_t virtual_addr, uint32_t physical_addr, uint32_t attributes) {
+    // Подготовка значений для записи в TLB
+    // Используется инструкция tlbwe (пример для PowerPC)
+    // Формат записи зависит от архитектуры Xenon, здесь приведен упрощенный пример
+    uint32_t tlb_hi = (virtual_addr & 0xFFFFF000) | (attributes & 0xFFF);
+    uint32_t tlb_lo = (physical_addr & 0xFFFFF000) | (attributes & 0xFFF);
+    
+    // Запись в специальные регистры TLB (предполагаемые номера для Xenon)
+    write_spr(688, tlb_hi); // SPR 688 - TLB High
+    write_spr(689, tlb_lo); // SPR 689 - TLB Low
+    write_spr(690, index);  // SPR 690 - TLB Index
+    
+    // Выполнение инструкции tlbwe для записи в TLB
+    asm volatile ("tlbwe" : : : "memory");
+}
+
+/* Функция для обеспечения когерентности кэша */
+void cache_coherency_sync() {
+    asm volatile (
+        "sync\n"
+        "isync\n"
+        : : : "memory"
+    );
+}
+
+/* Функция для очистки кэша данных */
+void flush_data_cache(void* addr, uint32_t size) {
+    // Очистка кэша данных для указанного диапазона адресов
+    // Используется инструкция dcbst для сброса кэша в память
+    // Пример для PowerPC, адаптированный для Xenon
+    uint8_t* ptr = (uint8_t*)addr;
+    uint8_t* end = ptr + size;
+    const uint32_t cache_line_size = 32; // Предполагаемый размер строки кэша для Xenon
+    
+    while (ptr < end) {
+        asm volatile ("dcbst 0, %0" : : "r"(ptr) : "memory");
+        ptr += cache_line_size;
+    }
+    cache_coherency_sync(); // Обеспечение когерентности после очистки
+}
+
+/* Инициализация низкоуровневых утилит */
+void init_powerpc_utils() {
+    // Здесь можно добавить дополнительную инициализацию
+    // Например, настройка начальных значений регистров или проверка доступности инструкций
+}
+```
+
+## CPU/loader/start.S
+```
+/* start.S - Ассемблерный код для начального загрузчика кастомного ядра Xbox 360 */
+/* Этот файл отвечает за базовую инициализацию и переход в привилегированный режим */
+
+.global _start
+_start:
+    /* Настройка стека */
+    lis     r1, 0x1fff        /* Установка верхней части адреса стека */
+    ori     r1, r1, 0xffff    /* Установка нижней части адреса стека */
+    li      r0, 0
+    stwu    r0, -8(r1)        /* Инициализация стека */
+
+    /* Сброс регистра LR (Link Register) */
+    mtlr    r0
+
+    /* Переход в привилегированный режим через настройку MSR (Machine State Register) */
+    mfmsr   r3
+    ori     r3, r3, 0x2000    /* Включение режима супервизора */
+    mtmsr   r3
+
+    /* Вызов главной функции на C */
+    bl      main
+
+    /* Вечный цикл, чтобы не выйти из программы */
+1:  b       1b
+```
+
+## CPU/loader/main.c
+```
+/* main.c - Основной код для кастомного загрузчика ядра Xbox 360 */
+/* Этот файл инициализирует систему и захватывает остальные ядра процессора */
+
+#include <stdint.h>
+
+// Регистры и функции для работы с ядрами (упрощённый пример)
+#define CORE1_START_ADDR_REG 0xXXXXXXX // Адрес регистра для ядра 1 (заменить на реальный)
+#define CORE2_START_ADDR_REG 0xXXXXXXX // Адрес регистра для ядра 2 (заменить на реальный)
+#define START_EXECUTION 0x1 // Команда для старта выполнения
+
+// Функция для записи в специальные регистры
+void write_register(uint32_t reg, uint32_t value) {
+    write_spr(reg, value);
+}
+
+// Функция для отправки IPI (Inter-Processor Interrupt)
+void send_ipi(int core_id) {
+    send_ipi_to_core(core_id, 0); // Вектор прерывания 0 как пример
+}
+
+// Рабочая функция для второстепенных ядер
+void worker_function(void* arg) {
+    // Бесконечный цикл для выполнения задач
+    while (1) {
+        // Здесь будет реализация обработки задач
+    }
+}
+
+// Функция для старта остальных ядер
+void start_other_cores(void (*worker_func)(void*)) {
+    // Записываем адрес старта в специальные регистры для ядер 1 и 2
+    write_register(CORE1_START_ADDR_REG, (uint32_t)worker_func);
+    write_register(CORE2_START_ADDR_REG, (uint32_t)worker_func);
+
+    // Отправляем IPI на ядра 1 и 2 для старта выполнения
+    send_ipi(1);
+    send_ipi(2);
+}
+
+int main() {
+    // Инициализация системы
+    // Здесь можно добавить дополнительную настройку окружения
+
+    // Инициализация низкоуровневых утилит PowerPC
+    init_powerpc_utils();
+    
+    // Инициализация планировщика задач (микроядро)
+    init_scheduler();
+    
+    // Инициализация менеджера памяти (MMU)
+    init_mmu_manager();
+    
+    // Инициализация SIMD-модуля
+    init_simd_module();
+    
+    // Инициализация профайлера
+    init_profiler();
+    
+    // Инициализация интеграции с Aurora
+    init_aurora_xpm();
+    setup_autoload();
+
+    // Запуск остальных ядер
+    start_other_cores(worker_function);
+
+    // Основной цикл для ядра 0
+    while (1) {
+        // Обновление UI Aurora
+        update_aurora_ui();
+        
+        // Автоматическая оптимизация CPU
+        auto_optimize_cpu();
+        
+        // Запуск профилирования
+        start_profiling();
+        
+        // Здесь будет реализация обработки задач для основного ядра
+    }
+
+    return 0; // Никогда не должно произойти
+}
+```
+
+## CPU/aurora_integration/aurora_xpm.c
+```
+/* aurora_xpm.c - Интеграция с Aurora для мониторинга и управления CPU Xbox 360 */
+/* Этот файл реализует расширение XPM (Xbox Performance Manager) для Aurora */
+
+#include <stdint.h>
+
+/* Функция для получения текущей температуры CPU */
+uint32_t get_cpu_temperature() {
+    // Чтение данных с температурных сенсоров через предполагаемый регистр
+    // Используется SPR 1008 как пример для Xenon (реальный номер может отличаться)
+    uint32_t temp_raw = read_spr(1008);
+    // Преобразование сырого значения в температуру в градусах Цельсия
+    // Предполагается линейное преобразование (пример)
+    return (temp_raw >> 24) & 0xFF; // Извлечение старшего байта как температуры
+}
+
+/* Функция для получения текущей частоты CPU */
+uint32_t get_cpu_frequency() {
+    // Чтение текущей частоты CPU через предполагаемый регистр
+    // Используется SPR 1009 как пример для Xenon (реальный номер может отличаться)
+    uint32_t freq_raw = read_spr(1009);
+    // Преобразование сырого значения в частоту в МГц
+    // Предполагается, что значение в регистре - это частота в кГц, делим на 1000
+    return (freq_raw / 1000);
+}
+
+/* Функция для установки частоты CPU (DVFS) */
+void set_cpu_frequency(uint32_t frequency) {
+    // Установка частоты CPU через предполагаемый регистр
+    // Используется SPR 1009 как пример для Xenon (реальный номер может отличаться)
+    // Частота передается в кГц, умножаем на 1000
+    uint32_t freq_khz = frequency * 1000;
+    write_spr(1009, freq_khz);
+    cache_coherency_sync(); // Обеспечение когерентности после записи
+}
+
+/* Функция для получения текущей нагрузки на ядра */
+void get_cpu_load(uint32_t* loads, int core_count) {
+    // Чтение нагрузки на каждое ядро через предполагаемые счетчики производительности
+    // Используется PMC (Performance Monitoring Counters) с SPR 771 и выше как пример
+    uint32_t counters[3];
+    read_performance_counters(counters, core_count);
+    for (int i = 0; i < core_count; i++) {
+        // Преобразование значения счетчика в процент нагрузки
+        // Предполагается, что максимальное значение счетчика за интервал - 100%
+        loads[i] = (counters[i] * 100) / 1000000; // Примерный порог для 100%
+        if (loads[i] > 100) loads[i] = 100; // Ограничение до 100%
+    }
+}
+
+/* Функция для отображения данных в интерфейсе Aurora */
+void update_aurora_ui() {
+    // Получение данных о температуре, частоте и нагрузке
+    uint32_t temperature = get_cpu_temperature();
+    uint32_t frequency = get_cpu_frequency();
+    uint32_t loads[3]; // Для трех ядер
+    get_cpu_load(loads, 3);
+    
+    // Здесь должна быть реализация передачи данных в UI Aurora
+    // Например, обновление виджетов или текстовых полей
+    // aurora_ui_update_temperature(temperature);
+    // aurora_ui_update_frequency(frequency);
+    // aurora_ui_update_load(loads);
+}
+
+/* Функция для автоматической оптимизации параметров CPU */
+void auto_optimize_cpu() {
+    // Получение текущей температуры и нагрузки
+    uint32_t temperature = get_cpu_temperature();
+    uint32_t loads[3];
+    get_cpu_load(loads, 3);
+    
+    // Простая логика оптимизации (пример)
+    if (temperature > 80) {
+        // Снижение частоты для уменьшения нагрева
+        set_cpu_frequency(2000); // 2.0 ГГц
+    } else if (temperature < 50 && loads[0] > 80) {
+        // Повышение частоты при высокой нагрузке и низкой температуре
+        set_cpu_frequency(3200); // 3.2 ГГц
+    }
+}
+
+/* Инициализация расширения XPM для Aurora */
+void init_aurora_xpm() {
+    // Инициализация модуля мониторинга и управления
+    // Здесь должна быть реализация регистрации расширения в Aurora
+    // aurora_register_extension("XPM", update_aurora_ui, auto_optimize_cpu);
+}
+
+/* Функция для добавления XPM в автозагрузку Aurora */
+void setup_autoload() {
+    // Здесь должна быть реализация добавления XPM в автозагрузку Aurora
+    // aurora_set_autoload("XPM", true);
+}
+```
+
+## Audio/audio_optimizer.h
+```
+#pragma once
+#include "../adapters/linux/platform_adapter_linux.h"
+#include <string>
+#include <vector>
+
+class IAudioOptimizer {
+public:
+    virtual bool Init(IPlatformAdapter* adapter) = 0;
+    virtual void Start() = 0;
+    virtual void Stop() = 0;
+    virtual void SetBufferSize(int ms) = 0;
+    virtual void EnableAsyncMode(bool enable) = 0;
+    virtual void SetSampleRate(int hz) = 0;
+    virtual void EnableUpsampling(bool enable) = 0;
+    virtual void EnableDenoise(bool enable) = 0;
+    virtual void SetEQProfile(const std::vector<float>& bands) = 0;
+    virtual void AutoEnhance() = 0;
+    virtual std::string QueryStatus() = 0;
+    virtual ~IAudioOptimizer() {}
+};
+```
+
+## Audio/audio_optimizer.cpp
+```
+#include "audio_optimizer.h"
+#include <vector>
+#include <string>
+#include <fstream>
+#include <algorithm>
+
+class AudioOptimizer : public IAudioOptimizer {
+    IPlatformAdapter* adapter = nullptr;
+    std::string status = "init";
+    bool upsampling = false;
+    bool denoise = false;
+    std::vector<float> eq_bands;
+public:
+    bool Init(IPlatformAdapter* a) override {
+        adapter = a;
+        status = "initialized";
+        return true;
+    }
+    void Start() override {
+        status = "running";
+    }
+    void Stop() override {
+        status = "stopped";
+    }
+    void SetBufferSize(int ms) override {
+        if (adapter) adapter->SetAudioBufferSize(ms);
+        status = "audio_buffer=" + std::to_string(ms);
+    }
+    void EnableAsyncMode(bool enable) override {
+        if (adapter) adapter->SetAudioAsyncMode(enable);
+        status = enable ? "audio_async=on" : "audio_async=off";
+    }
+    void SetSampleRate(int hz) override {
+        if (adapter) adapter->SetAudioSampleRate(hz);
+        status = "audio_rate=" + std::to_string(hz);
+    }
+    void EnableUpsampling(bool enable) override {
+        upsampling = enable;
+        // Пример: через PulseAudio module-ladspa-sink или sox
+        if (enable) system("pactl load-module module-ladspa-sink label=up-sample"), status = "upsampling=on";
+        else status = "upsampling=off";
+    }
+    void EnableDenoise(bool enable) override {
+        denoise = enable;
+        // Пример: через PulseAudio module-ladspa-sink или sox
+        if (enable) system("pactl load-module module-ladspa-sink label=noise_suppressor"), status = "denoise=on";
+        else status = "denoise=off";
+    }
+    void SetEQProfile(const std::vector<float>& bands) override {
+        eq_bands = bands;
+        // Пример: через PulseAudio module-ladspa-sink или alsaequal
+        status = "eq_profile_set";
+    }
+    void AutoEnhance() override {
+        // Автоматическая коррекция: апсемплинг, шумоподавление, эквализация
+        EnableUpsampling(true);
+        EnableDenoise(true);
+        SetEQProfile({1.1f, 1.05f, 1.0f, 1.05f, 1.1f}); // Лёгкая V-образная коррекция
+        status = "auto_enhance=on";
+    }
+    std::string QueryStatus() override {
+        return status;
+    }
+    ~AudioOptimizer() {}
+};
+```
+
+## adapters/linux/platform_adapter_linux.h
+```
+#pragma once
+#include <string>
+
+class IPlatformAdapter {
+public:
+    virtual bool SetCpuGovernor(const std::string& governor) = 0;
+    virtual bool SetSwappiness(int value) = 0;
+    virtual bool DropCaches() = 0;
+    virtual bool EnableHugePages(bool enable) = 0;
+    virtual bool SetIOScheduler(const std::string& device, const std::string& scheduler) = 0;
+    virtual bool SetReadAhead(const std::string& device, int kb) = 0;
+    virtual bool SetPowerProfile(const std::string& profile) = 0;
+    virtual bool SetScreenOffTimeout(int seconds) = 0;
+    virtual bool SetGPUPerformanceLevel(const std::string& level) = 0;
+    virtual bool SetGPUPowerLimit(int percent) = 0;
+    virtual bool SetGPUFanSpeed(int percent) = 0;
+    virtual bool SetAudioBufferSize(int ms) = 0;
+    virtual bool SetAudioAsyncMode(bool enable) = 0;
+    virtual bool SetAudioSampleRate(int hz) = 0;
+    virtual ~IPlatformAdapter() {}
+};
+```
