@@ -10,17 +10,56 @@ find_package(Qt5 COMPONENTS Widgets Svg OpenGL REQUIRED)
 find_path(IMGUI_INCLUDE_DIR imgui.h)
 find_library(IMGUI_LIB NAMES imgui)
 if(NOT IMGUI_INCLUDE_DIR OR NOT IMGUI_LIB)
-    message(FATAL_ERROR "Не найдена библиотека ImGui! Установите её через пакетный менеджер или соберите из исходников.")
+    message(STATUS "ImGui не найдена в системе, будет загружена и собрана из GitHub...")
+    include(FetchContent)
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG v1.90.4
+    )
+    FetchContent_MakeAvailable(imgui)
+    set(IMGUI_INCLUDE_DIR ${imgui_SOURCE_DIR})
+    set(IMGUI_LIB imgui)
+    message(STATUS "ImGui загружена и готова к использованию.")
+else()
+    message(STATUS "ImGui найдена в системе.")
 endif()
 
 # --- ALSA ---
-find_package(ALSA REQUIRED)
+find_package(ALSA QUIET)
+if(NOT ALSA_FOUND)
+    message(STATUS "ALSA не найдена в системе, будет загружена и собрана из GitHub...")
+    include(FetchContent)
+    FetchContent_Declare(
+        alsa
+        GIT_REPOSITORY https://github.com/alsa-project/alsa-lib.git
+        GIT_TAG v1.2.11
+    )
+    FetchContent_MakeAvailable(alsa)
+    set(ALSA_INCLUDE_DIRS ${alsa_SOURCE_DIR}/include)
+    set(ALSA_LIBRARIES alsa)
+    message(STATUS "ALSA загружена и готова к использованию.")
+else()
+    message(STATUS "ALSA найдена в системе.")
+endif()
 
 # --- PulseAudio ---
 find_path(PULSEAUDIO_INCLUDE_DIR pulse/pulseaudio.h)
 find_library(PULSEAUDIO_LIB NAMES pulse)
 if(NOT PULSEAUDIO_INCLUDE_DIR OR NOT PULSEAUDIO_LIB)
-    message(FATAL_ERROR "Не найдена библиотека PulseAudio! Установите libpulse-dev (Debian/Ubuntu) или pulseaudio (Arch).")
+    message(STATUS "PulseAudio не найдена в системе, будет загружена и собрана из GitHub...")
+    include(FetchContent)
+    FetchContent_Declare(
+        pulseaudio
+        GIT_REPOSITORY https://github.com/pulseaudio/pulseaudio.git
+        GIT_TAG v17.0
+    )
+    FetchContent_MakeAvailable(pulseaudio)
+    set(PULSEAUDIO_INCLUDE_DIR ${pulseaudio_SOURCE_DIR}/src)
+    set(PULSEAUDIO_LIB pulse)
+    message(STATUS "PulseAudio загружена и готова к использованию.")
+else()
+    message(STATUS "PulseAudio найдена в системе.")
 endif()
 
 # --- NVML (NVIDIA) ---
@@ -78,4 +117,4 @@ set_target_properties(OptiCorePanel PROPERTIES
 )
 
 # Сообщение об успешной конфигурации
-message(STATUS "OptiCore готов к сборке! Все основные зависимости найдены.") 
+message(STATUS "OptiCore готов к сборке! Все основные зависимости найдены.")

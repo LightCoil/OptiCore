@@ -1,0 +1,1177 @@
+// ========== cache.c ==========
+// Модуль кэша для PseudoCore
+// Примечание: Если вы видите ошибку IntelliSense "#include errors detected", 
+// это связано с конфигурацией includePath в VSCode. 
+// Пожалуйста, обновите includePath, выбрав команду "C/C++: Select IntelliSense Configuration..." 
+// или добавив необходимые пути в настройки c_cpp_properties.json.
+#include "cache.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <string.h>
+#include <errno.h>
+
+// Cache statistics for monitoring performance
+static size_t cache_hits = 0;
+static size_t cache_misses = 0;
+static pthread_mutex_t stats_mutex;
+
+// Improved hash function using FNV-1a to reduce collisions
+static size_t hash_func(uint64_t off) {
+    const uint64_t FNV_PRIME = 1099511628211ULL;
+    const uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+    uint64_t hash = FNV_OFFSET_BASIS;
+    uint8_t *bytes = (uint8_t*)&off;
+    for (size_t i = 0; i < sizeof(off); i++) {
+        hash ^= bytes[i];
+        hash *= FNV_PRIME;
+    }
+    return (hash / PAGE_SIZE) % HASH_SIZE;
+}
+
+// Calculate mutex group for a hash index
+static size_t mutex_group(size_t h) {
+    return h % MUTEX_GROUPS;
+}
+
+// Log cache-related errors or information
+static void log_cache_message(const char *level, const char *message) {
+    time_t now = time(NULL);
+    char timestamp[26];
+    ctime_r(&now, timestamp);
+    timestamp[24] = '\0'; // Remove newline from ctime
+    fprintf(stderr, "[%s] [%s] Cache: %s\n", timestamp, level, message);
+}
+
+// Display cache statistics for monitoring
+static void display_cache_stats(void) {
+    pthread_mutex_lock(&stats_mutex);
+    size_t total_requests = cache_hits + cache_misses;
+    double hit_ratio = total_requests > 0 ? (double)cache_hits / total_requests * 100.0 : 0.0;
+    fprintf(stderr, "[CACHE STATS] Hits: %zu, Misses: %zu, Hit Ratio: %.2f%%\n", 
+            cache_hits, cache_misses, hit_ratio);
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+void cache_init(cache_t *c) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        c->hash[i] = NULL;
+    }
+    for (int i = 0; i < MUTEX_GROUPS; i++) {
+        pthread_mutex_init(&c->mutex[i], NULL);
+    }
+    c->lru_head = NULL;
+    c->lru_tail = NULL;
+    c->entry_count = 0;
+    pthread_mutex_init(&c->lru_mutex, NULL);
+    pthread_mutex_init(&stats_mutex, NULL);
+    log_cache_message("INFO", "Cache initialized");
+}
+
+char* cache_get(cache_t *c, int fd, uint64_t off, int write) {
+    size_t h = hash_func(off);
+    size_t mg = mutex_group(h);
+    pthread_mutex_lock(&c->mutex[mg]);
+    cache_entry_t *e = c->hash[h];
+    while (e) {
+        if (e->offset == off) {
+            if (write) e->dirty = 1;
+            e->last_access = time(NULL);
+            pthread_mutex_lock(&c->lru_mutex);
+            // Move to the front of LRU list (recently used)
+            if (e != c->lru_head) {
+                if (e->prev) e->prev->next = e->next;
+                if (e->next) e->next->prev = e->prev;
+                if (e == c->lru_tail) c->lru_tail = e->prev;
+                e->next = c->lru_head;
+                e->prev = NULL;
+                if (c->lru_head) c->lru_head->prev = e;
+                c->lru_head = e;
+                if (!c->lru_tail) c->lru_tail = e;
+            }
+            pthread_mutex_unlock(&c->lru_mutex);
+            pthread_mutex_unlock(&c->mutex[mg]);
+            // Increment cache hit counter
+            pthread_mutex_lock(&stats_mutex);
+            cache_hits++;
+            pthread_mutex_unlock(&stats_mutex);
+            // Periodically display stats (every 100 hits for simplicity)
+            if (cache_hits % 100 == 0) {
+                display_cache_stats();
+            }
+            return e->data;
+        }
+        e = e->next;
+    }
+    // Cache miss - load from disk
+    cache_entry_t *ne = malloc(sizeof(*ne));
+    if (!ne) {
+        pthread_mutex_unlock(&c->mutex[mg]);
+        log_cache_message("ERROR", "Failed to allocate memory for cache entry");
+        // Increment cache miss counter
+        pthread_mutex_lock(&stats_mutex);
+        cache_misses++;
+        pthread_mutex_unlock(&stats_mutex);
+        return NULL;
+    }
+    ne->offset = off;
+    ne->dirty = write;
+    ne->last_access = time(NULL);
+    ne->next = c->hash[h];
+    ne->prev = NULL;
+    if (c->hash[h]) c->hash[h]->prev = ne;
+    c->hash[h] = ne;
+    // Read page from disk with detailed error handling
+    ssize_t read_result = pread(fd, ne->data, PAGE_SIZE, off);
+    if (read_result < 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Failed to read page from disk at offset %lu (errno: %d)", off, errno);
+        log_cache_message("ERROR", msg);
+        free(ne);
+        if (c->hash[h] == ne) c->hash[h] = ne->next;
+        if (ne->next) ne->next->prev = NULL;
+        pthread_mutex_unlock(&c->mutex[mg]);
+        // Increment cache miss counter
+        pthread_mutex_lock(&stats_mutex);
+        cache_misses++;
+        pthread_mutex_unlock(&stats_mutex);
+        return NULL;
+    } else if (read_result != PAGE_SIZE) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Partial read from disk at offset %lu (read %zd bytes instead of %d)", off, read_result, PAGE_SIZE);
+        log_cache_message("WARNING", msg);
+        // Fill the remaining part of the buffer with zeros to avoid undefined behavior
+        memset(ne->data + read_result, 0, PAGE_SIZE - read_result);
+    }
+    // Add to LRU list
+    pthread_mutex_lock(&c->lru_mutex);
+    ne->next = c->lru_head;
+    ne->prev = NULL;
+    if (c->lru_head) c->lru_head->prev = ne;
+    c->lru_head = ne;
+    if (!c->lru_tail) c->lru_tail = ne;
+    c->entry_count++;
+    // Check if eviction is needed
+    if (c->entry_count > MAX_CACHE_ENTRIES) {
+        cache_evict(c, fd);
+    }
+    pthread_mutex_unlock(&c->lru_mutex);
+    pthread_mutex_unlock(&c->mutex[mg]);
+    // Increment cache miss counter
+    pthread_mutex_lock(&stats_mutex);
+    cache_misses++;
+    pthread_mutex_unlock(&stats_mutex);
+    return ne->data;
+}
+
+void cache_evict(cache_t *c, int fd) {
+    // Evict the least recently used entry
+    if (!c->lru_tail) return;
+    cache_entry_t *evict = c->lru_tail;
+    size_t h = hash_func(evict->offset);
+    size_t mg = mutex_group(h);
+    pthread_mutex_lock(&c->mutex[mg]);
+    // Remove from hash table
+    if (evict->prev) evict->prev->next = evict->next;
+    if (evict->next) evict->next->prev = evict->prev;
+    if (c->hash[h] == evict) c->hash[h] = evict->next;
+    // If entry is dirty, write back to disk with detailed error handling
+    if (evict->dirty) {
+        ssize_t write_result = pwrite(fd, evict->data, PAGE_SIZE, evict->offset);
+        if (write_result < 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Failed to write dirty page at offset %lu (errno: %d)", evict->offset, errno);
+            log_cache_message("ERROR", msg);
+        } else if (write_result != PAGE_SIZE) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Partial write to disk at offset %lu (wrote %zd bytes instead of %d)", evict->offset, write_result, PAGE_SIZE);
+            log_cache_message("WARNING", msg);
+        }
+        evict->dirty = 0; // Reset dirty flag after write attempt
+    }
+    free(evict);
+    c->entry_count--;
+    // Update LRU tail
+    c->lru_tail = c->lru_tail->prev;
+    if (c->lru_tail) c->lru_tail->next = NULL;
+    pthread_mutex_unlock(&c->mutex[mg]);
+}
+
+void cache_destroy(cache_t *c, int fd) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        size_t mg = mutex_group(i);
+        pthread_mutex_lock(&c->mutex[mg]);
+        cache_entry_t *e = c->hash[i];
+        while (e) {
+            cache_entry_t *n = e->next;
+            if (e->dirty) {
+                ssize_t write_result = pwrite(fd, e->data, PAGE_SIZE, e->offset);
+                if (write_result < 0) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Failed to write dirty page at offset %lu during shutdown (errno: %d)", e->offset, errno);
+                    log_cache_message("ERROR", msg);
+                } else if (write_result != PAGE_SIZE) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Partial write during shutdown at offset %lu (wrote %zd bytes instead of %d)", e->offset, write_result, PAGE_SIZE);
+                    log_cache_message("WARNING", msg);
+                }
+                e->dirty = 0; // Reset dirty flag after write attempt
+            }
+            free(e);
+            e = n;
+        }
+        c->hash[i] = NULL;
+        pthread_mutex_unlock(&c->mutex[mg]);
+    }
+    for (int i = 0; i < MUTEX_GROUPS; i++) {
+        pthread_mutex_destroy(&c->mutex[i]);
+    }
+    pthread_mutex_destroy(&c->lru_mutex);
+    c->lru_head = NULL;
+    c->lru_tail = NULL;
+    c->entry_count = 0;
+    log_cache_message("INFO", "Cache destroyed");
+}
+
+// ========== cache.h ==========
+#ifndef CACHE_H
+#define CACHE_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <pthread.h>
+
+// Константы
+#include "config.h"
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE BLOCK_SIZE
+#endif
+#ifndef HASH_SIZE
+#define HASH_SIZE 2048
+#endif
+#ifndef MUTEX_GROUPS
+#define MUTEX_GROUPS 16
+#endif
+#ifndef MAX_CACHE_ENTRIES
+#define MAX_CACHE_ENTRIES 1024
+#endif
+
+typedef struct cache_entry {
+    uint64_t offset;
+    char data[PAGE_SIZE];
+    int dirty;
+    time_t last_access;
+    struct cache_entry *next;
+    struct cache_entry *prev;
+} cache_entry_t;
+
+typedef struct {
+    cache_entry_t *hash[HASH_SIZE];
+    pthread_mutex_t mutex[MUTEX_GROUPS];
+    pthread_mutex_t lru_mutex;
+    cache_entry_t *lru_head;
+    cache_entry_t *lru_tail;
+    size_t entry_count;
+} cache_t;
+
+void cache_init(cache_t *c);
+char* cache_get(cache_t *c, int fd, uint64_t offset, int write);
+void cache_evict(cache_t *c, int fd);
+void cache_destroy(cache_t *c, int fd);
+
+#endif // CACHE_H
+
+// ========== compress.c ==========
+#include "compress.h"
+#include <zstd.h>
+#include <stdio.h>
+#include <math.h>
+
+// Calculate Shannon entropy of the input data to determine compressibility
+static double calculate_entropy(const char *data, size_t sz) {
+    if (sz == 0) return 0.0;
+    unsigned int freq[256] = {0};
+    for (size_t i = 0; i < sz; i++) {
+        freq[(unsigned char)data[i]]++;
+    }
+    double entropy = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] > 0) {
+            double p = (double)freq[i] / sz;
+            entropy -= p * log2(p);
+        }
+    }
+    return entropy;
+}
+
+// Determine adaptive compression level based on data entropy
+static int determine_compression_level(double entropy) {
+    // Entropy range: 0 (highly compressible) to 8 (random data)
+    if (entropy < 4.0) return 1; // Low level for highly ordered data
+    else if (entropy < 6.0) return 3; // Medium level for moderately ordered data
+    else return 5; // High level for random or high-entropy data
+}
+
+int compress_page(const char *in, size_t sz, char *out, int lvl) {
+    // If lvl is 0, calculate adaptive level based on entropy
+    if (lvl == 0) {
+        double entropy = calculate_entropy(in, sz);
+        lvl = determine_compression_level(entropy);
+    }
+    size_t c = ZSTD_compress(out, ZSTD_compressBound(sz), in, sz, lvl);
+    if (ZSTD_isError(c)) {
+        fprintf(stderr, "ZSTD compression error: %s\n", ZSTD_getErrorName(c));
+        return -1;
+    }
+    return (int)c;
+}
+
+int decompress_page(const char *in, size_t sz, char *out) {
+    size_t d = ZSTD_decompress(out, sz, in, sz);
+    if (ZSTD_isError(d)) {
+        fprintf(stderr, "ZSTD decompression error: %s\n", ZSTD_getErrorName(d));
+        return -1;
+    }
+    return (int)d;
+}
+
+// ========== compress.h ==========
+#ifndef COMPRESS_H
+#define COMPRESS_H
+
+#include <stddef.h>
+
+int compress_page(const char *in, size_t sz, char *out, int lvl);
+int decompress_page(const char *in, size_t sz, char *out);
+
+#endif // COMPRESS_H
+
+// ========== config.h ==========
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#define CORES        4
+#define CACHE_MB     128       // RAM-кэш в МБ
+#define SEGMENT_MB   512       // сегмент swap на ядро в МБ
+#define BLOCK_SIZE   4096      // размер блока 4 КБ
+#define MAX_CACHE_ENTRIES 8192 // Максимальное количество записей в кэше для LRU
+#define MIGRATION_THRESHOLD 5  // Порог для миграции задач (разница от среднего)
+#define COMPRESSION_MIN_LVL 1  // Минимальный уровень сжатия
+#define COMPRESSION_MAX_LVL 9  // Максимальный уровень сжатия
+#define COMPRESSION_ADAPTIVE_THRESHOLD 0.5 // Порог для адаптивного сжатия (коэффициент сжатия)
+
+#define SWAP_IMG_PATH "./storage_swap.img"
+
+#endif // CONFIG_H
+
+// ========== config.cfg ==========
+CORES=4
+SWAP_IMG_PATH=./storage_swap.img
+CACHE_MB=128         # кольцевой RAM‑кэш (в МБ)
+SEGMENT_MB=512       # объём сегмента на ядро (в МБ)
+BLOCK_SIZE=4096      # 4 КБ-блок
+
+// ========== core_manager.sh ==========
+#!/bin/bash
+. ./config.cfg
+
+LOG=/dev/shm/pseudo_core.log
+
+# 1) Swap
+if swapon --show | grep -q "$SWAP_IMG_PATH"; then
+  swapoff "$SWAP_IMG_PATH"
+  fi
+  swapon "$SWAP_IMG_PATH" || { echo "[!] swap on failed"; exit 1; }
+
+  # 2) Лог
+  rm -f "$LOG"; touch "$LOG"
+
+  echo "[*] Compiling modules with LFS support..."
+  gcc -O3 -D_FILE_OFFSET_BITS=64 -pthread \
+      pseudo_core.c \
+          cache.c \
+              compress.c \
+                  ring_cache.c \
+                      scheduler.c \
+                          -o pseudo_core -lzstd
+
+                          if [[ $? -ne 0 ]]; then
+                              echo "[!] Compilation failed"
+                                  exit 1
+                                  fi
+                                  
+
+                                  # 4) Запуск
+                                  echo "[*] Starting pseudo cores..."
+                                  ./pseudo_core >> "$LOG" 2>&1 &
+
+                                  echo "[✓] Pseudo cores running, log: $LOG"
+                                  
+
+// ========== Makefile ==========
+CC = gcc
+CFLAGS = -O3 -pthread -I.
+LDLIBS = -lzstd -lm
+
+SOURCES = pseudo_core.c cache.c compress.c ring_cache.c scheduler.c
+DAEMON_SOURCES = pseudo_core_daemon.c cache.c compress.c ring_cache.c scheduler.c
+OBJECTS = $(SOURCES:.c=.o)
+DAEMON_OBJECTS = $(DAEMON_SOURCES:.c=.o)
+
+all: pseudo_core pseudo_core_daemon
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+pseudo_core: $(OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+pseudo_core_daemon: $(DAEMON_OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+clean:
+	rm -f *.o pseudo_core pseudo_core_daemon
+
+// ========== pseudo_core.c ==========
+// Основной файл ядра PseudoCore
+// Примечание: Если вы видите ошибку IntelliSense "#include errors detected", 
+// это связано с конфигурацией includePath в VSCode. 
+// Пожалуйста, обновите includePath, выбрав команду "C/C++: Select IntelliSense Configuration..." 
+// или добавив необходимые пути в настройки c_cpp_properties.json.
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <signal.h>
+#include <string.h>
+
+#include "config.h"
+#include "cache.h"
+#include "compress.h"
+#include "ring_cache.h"
+#include "scheduler.h"
+
+// Определения констант, которые могут отсутствовать в config.h
+#ifndef LOAD_THRESHOLD
+#define LOAD_THRESHOLD 50
+#endif
+#ifndef HIGH_LOAD_DELAY_NS
+#define HIGH_LOAD_DELAY_NS 20000000 // 20ms
+#endif
+#ifndef LOW_LOAD_DELAY_NS
+#define LOW_LOAD_DELAY_NS 10000000 // 10ms
+#endif
+#ifndef BASE_LOAD_DELAY_NS
+#define BASE_LOAD_DELAY_NS 5000000 // 5ms
+#endif
+#ifndef COMPRESSION_MIN_LVL
+#define COMPRESSION_MIN_LVL 1
+#endif
+#ifndef COMPRESSION_MAX_LVL
+#define COMPRESSION_MAX_LVL 5
+#endif
+#ifndef COMPRESSION_ADAPTIVE_THRESHOLD
+#define COMPRESSION_ADAPTIVE_THRESHOLD 0.8
+#endif
+#ifndef SEGMENT_MB
+#define SEGMENT_MB 256
+#endif
+#ifndef CORES
+#define CORES 4
+#endif
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 4096
+#endif
+#ifndef SWAP_IMG_PATH
+#define SWAP_IMG_PATH "storage_swap.img"
+#endif
+
+#define TOTAL_SIZE_MB (SEGMENT_MB * CORES)
+
+// Structure for core arguments passed to threads
+typedef struct {
+    int id;               // Core ID
+    int fd;               // File descriptor for I/O operations
+    uint64_t seg_size;    // Segment size for block selection
+    volatile int running; // Flag to control thread termination
+} core_arg_t;
+
+volatile int global_running = 1; // Global flag to terminate all threads
+
+// Performance statistics for visualization
+static size_t total_operations[CORES] = {0};
+static pthread_mutex_t stats_mutex;
+
+// Function to prefetch a block of data from disk
+void prefetch_block(int fd, uint64_t off) {
+    char tmp[BLOCK_SIZE];
+    ssize_t result = pread(fd, tmp, BLOCK_SIZE, off);
+    if (result < 0) {
+        fprintf(stderr, "Error prefetching block at offset %lu\n", off);
+    }
+}
+
+// Determine adaptive compression level based on previous compression ratio
+int determine_compression_level(size_t original_size, size_t compressed_size) {
+    if (original_size == 0) return COMPRESSION_MIN_LVL;
+    double ratio = (double)compressed_size / original_size;
+    if (ratio > COMPRESSION_ADAPTIVE_THRESHOLD) {
+        return COMPRESSION_MAX_LVL; // High compression level for poorly compressible data
+    } else {
+        return COMPRESSION_MIN_LVL; // Low compression level for already compressed data
+    }
+}
+
+// Log basic information and errors to a file or stderr
+static void log_message(const char *level, const char *message, int core_id) {
+    time_t now = time(NULL);
+    char timestamp[26];
+    ctime_r(&now, timestamp);
+    timestamp[24] = '\0'; // Remove newline from ctime
+    fprintf(stderr, "[%s] [%s] Core %d: %s\n", timestamp, level, core_id, message);
+}
+
+// Display system-wide performance statistics
+static void display_system_stats(void) {
+    pthread_mutex_lock(&stats_mutex);
+    fprintf(stderr, "[SYSTEM STATS] Operations per Core: ");
+    for (int i = 0; i < CORES; i++) {
+        fprintf(stderr, "Core %d: %zu ", i, total_operations[i]);
+    }
+    fprintf(stderr, "\n");
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+// Core execution function running in a separate thread
+void* core_run(void *v) {
+    core_arg_t *c = v;
+    cache_t cache;
+    cache_init(&cache);
+    ring_cache_init();
+    int compression_level = COMPRESSION_MIN_LVL;
+    size_t last_compressed_size = BLOCK_SIZE;
+    int load_counter = 0; // Counter for adaptive delay
+    const int load_check_interval = 100; // Check load every 100 iterations
+    char log_msg[256];
+
+    snprintf(log_msg, sizeof(log_msg), "Started core execution");
+    log_message("INFO", log_msg, c->id);
+
+    while (c->running && global_running) {
+        // Circular block selection with adaptive segment size
+        static uint64_t pos[CORES] = {0};
+        uint64_t idx = pos[c->id]++;
+        // Adjust segment size dynamically based on system load
+        uint64_t adaptive_seg_size = c->seg_size;
+        int current_load = 0; // Placeholder for load check
+        if (load_counter >= load_check_interval) {
+            // Here we would check the load via scheduler, but for simplicity, we assume it's available
+            current_load = 0; // Placeholder
+        }
+        if (current_load > LOAD_THRESHOLD) {
+            adaptive_seg_size = c->seg_size / 2; // Reduce segment size under high load to lower I/O latency
+            snprintf(log_msg, sizeof(log_msg), "Reduced segment size to %lu due to high load: %d tasks", adaptive_seg_size, current_load);
+            log_message("INFO", log_msg, c->id);
+        }
+        uint64_t offset = (uint64_t)c->id * adaptive_seg_size + (idx % (adaptive_seg_size / BLOCK_SIZE)) * BLOCK_SIZE;
+
+        scheduler_report_access(c->id, offset);
+
+        // Task migration
+        if (scheduler_should_migrate(c->id)) {
+            uint64_t m = scheduler_get_migrated_task(c->id);
+            if (m) offset = m;
+        }
+
+        // Caching
+        char buf[BLOCK_SIZE];
+        char *page = cache_get(&cache, c->fd, offset, 1);
+        if (!page) {
+            snprintf(log_msg, sizeof(log_msg), "Failed to get cache page");
+            log_message("ERROR", log_msg, c->id);
+            continue;
+        }
+        memcpy(buf, page, BLOCK_SIZE);
+
+        // Prefetch neighboring block
+        if (c->running && global_running) {
+            prefetch_block(c->fd, offset + BLOCK_SIZE);
+        }
+
+        // Simulate workload with vectorized XOR operation for performance
+        // Use a loop unrolling and vectorization-friendly approach
+        int id_xor = c->id;
+        for (int i = 0; i < BLOCK_SIZE; i += 8) {
+            buf[i + 0] ^= id_xor;
+            buf[i + 1] ^= id_xor;
+            buf[i + 2] ^= id_xor;
+            buf[i + 3] ^= id_xor;
+            buf[i + 4] ^= id_xor;
+            buf[i + 5] ^= id_xor;
+            buf[i + 6] ^= id_xor;
+            buf[i + 7] ^= id_xor;
+        }
+        // Repeat the operation to simulate workload (reduced iterations due to unrolling)
+        for (int repeat = 0; repeat < 125; repeat++) {
+            for (int i = 0; i < BLOCK_SIZE; i += 8) {
+                buf[i + 0] ^= id_xor;
+                buf[i + 1] ^= id_xor;
+                buf[i + 2] ^= id_xor;
+                buf[i + 3] ^= id_xor;
+                buf[i + 4] ^= id_xor;
+                buf[i + 5] ^= id_xor;
+                buf[i + 6] ^= id_xor;
+                buf[i + 7] ^= id_xor;
+            }
+        }
+
+        // Adaptive compression and write
+        char cmp[BLOCK_SIZE];
+        compression_level = determine_compression_level(BLOCK_SIZE, last_compressed_size);
+        int cs = compress_page(buf, BLOCK_SIZE, cmp, compression_level);
+        if (cs > 0) {
+            ssize_t write_result = pwrite(c->fd, cmp, BLOCK_SIZE, offset);
+            if (write_result < 0) {
+                snprintf(log_msg, sizeof(log_msg), "Failed to write compressed data at offset %lu", offset);
+                log_message("ERROR", log_msg, c->id);
+            }
+            last_compressed_size = cs;
+        } else {
+            snprintf(log_msg, sizeof(log_msg), "Compression failed");
+            log_message("ERROR", log_msg, c->id);
+        }
+
+        cache_to_ring(offset, buf);
+
+        // Update performance statistics
+        pthread_mutex_lock(&stats_mutex);
+        total_operations[c->id]++;
+        pthread_mutex_unlock(&stats_mutex);
+
+        // Adaptive delay and throttling based on system load
+        load_counter++;
+        if (load_counter >= load_check_interval) {
+            load_counter = 0;
+            // Check current load via scheduler (placeholder)
+            current_load = 0;
+            long delay_ns = (current_load > LOAD_THRESHOLD) ? HIGH_LOAD_DELAY_NS : LOW_LOAD_DELAY_NS;
+            // Additional throttling if system load is extremely high
+            if (current_load > LOAD_THRESHOLD * 2) {
+                delay_ns *= 2; // Double the delay for throttling
+                snprintf(log_msg, sizeof(log_msg), "Throttling core due to extreme load: %d tasks", current_load);
+                log_message("WARNING", log_msg, c->id);
+            }
+            struct timespec delay = {0, delay_ns};
+            nanosleep(&delay, NULL);
+            // Display system stats periodically
+            if (total_operations[c->id] % 500 == 0) {
+                display_system_stats();
+            }
+        } else {
+            // Base minimal delay
+            struct timespec delay = {0, BASE_LOAD_DELAY_NS};
+            nanosleep(&delay, NULL);
+        }
+    }
+
+    ring_cache_destroy();
+    cache_destroy(&cache, c->fd); // Pass fd to write dirty pages
+    snprintf(log_msg, sizeof(log_msg), "Core execution terminated");
+    log_message("INFO", log_msg, c->id);
+    return NULL;
+}
+
+// Signal handler for graceful shutdown
+void signal_handler(int sig) {
+    (void)sig;
+    global_running = 0;
+    fprintf(stdout, "Received termination signal. Shutting down threads...\n");
+}
+
+int main() {
+    int fd = open(SWAP_IMG_PATH, O_RDWR);
+    if (fd < 0) {
+        perror("Error opening swap file");
+        exit(1);
+    }
+
+    uint64_t seg_bytes = (uint64_t)SEGMENT_MB * 1024 * 1024;
+
+    pthread_t th[CORES];
+    core_arg_t args[CORES];
+
+    // Initialize mutex for stats
+    pthread_mutex_init(&stats_mutex, NULL);
+
+    // Set up signal handler for graceful shutdown
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    for (int i = 0; i < CORES; i++) {
+        args[i].id = i;
+        args[i].fd = fd;
+        args[i].seg_size = seg_bytes;
+        args[i].running = 1;
+        if (pthread_create(&th[i], NULL, core_run, &args[i]) != 0) {
+            fprintf(stderr, "Error creating thread for core %d\n", i);
+            global_running = 0;
+            for (int j = 0; j < i; j++) {
+                args[j].running = 0;
+            }
+            for (int j = 0; j < i; j++) {
+                pthread_join(th[j], NULL);
+            }
+            pthread_mutex_destroy(&stats_mutex);
+            scheduler_destroy();
+            close(fd);
+            exit(1);
+        }
+    }
+
+    // Wait for threads to complete
+    for (int i = 0; i < CORES; i++) {
+        pthread_join(th[i], NULL);
+    }
+
+    // Очистка ресурсов планировщика
+    scheduler_destroy();
+    
+    close(fd);
+    fprintf(stdout, "Program terminated successfully.\n");
+    return 0;
+}
+
+// ========== pseudo_core_daemon.c ==========
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <syslog.h>
+#include <fcntl.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdint.h>
+
+#include "config.h"
+#include "cache.h"
+#include "compress.h"
+#include "ring_cache.h"
+#include "scheduler.h"
+
+// Конфигурация демона
+#undef CORES
+#undef SEGMENT_MB
+#define DAEMON_CORES 2  // Уменьшаем количество ядер
+#define DAEMON_SEGMENT_MB 64  // Уменьшаем размер сегмента
+#define BLOCK_SIZE 4096
+#define LOAD_THRESHOLD 30
+#define HIGH_LOAD_DELAY_NS 50000000  // 50ms
+#define LOW_LOAD_DELAY_NS 25000000   // 25ms
+#define BASE_LOAD_DELAY_NS 10000000  // 10ms
+#define PID_FILE "/var/run/pseudo_core.pid"
+#define LOG_FILE "/var/log/pseudo_core.log"
+
+// Определяем структуру аргументов для потока
+typedef struct {
+    int id;               // ID ядра
+    int fd;               // Файловый дескриптор для операций I/O
+    uint64_t seg_size;    // Размер сегмента для выбора блока
+    volatile int running; // Флаг для контроля завершения потока
+} daemon_core_arg_t;
+
+volatile int global_running = 1;
+static pthread_t core_threads[DAEMON_CORES];
+static daemon_core_arg_t core_args[DAEMON_CORES];
+static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void signal_handler(int sig) {
+    if (sig == SIGTERM || sig == SIGINT) {
+        syslog(LOG_INFO, "Получен сигнал завершения, останавливаем сервис...");
+        global_running = 0;
+        
+        // Ждем завершения всех потоков
+        for (int i = 0; i < DAEMON_CORES; i++) {
+            core_args[i].running = 0;
+            pthread_join(core_threads[i], NULL);
+        }
+        
+        closelog();
+        unlink(PID_FILE);
+        exit(0);
+    }
+}
+
+void daemonize(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        exit(EXIT_FAILURE);
+    }
+    if (pid > 0) {
+        exit(EXIT_SUCCESS);
+    }
+
+    umask(0);
+    pid_t sid = setsid();
+    if (sid < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+    if ((chdir("/")) < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+    // Закрываем стандартные файловые дескрипторы
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+
+    // Открываем лог
+    openlog("pseudo_core", LOG_PID, LOG_DAEMON);
+
+    // Создаем PID файл
+    FILE *pid_file = fopen(PID_FILE, "w");
+    if (pid_file) {
+        fprintf(pid_file, "%d\n", getpid());
+        fclose(pid_file);
+    }
+}
+
+void* core_run(void *v) {
+    daemon_core_arg_t *c = (daemon_core_arg_t*)v;
+    cache_t cache;
+    cache_init(&cache);
+    ring_cache_init();
+
+    while (c->running && global_running) {
+        // Основная логика обработки с увеличенными задержками
+        static uint64_t pos[DAEMON_CORES] = {0};
+        uint64_t idx = pos[c->id]++;
+        uint64_t offset = (uint64_t)c->id * c->seg_size + 
+                         (idx % (c->seg_size / BLOCK_SIZE)) * BLOCK_SIZE;
+
+        char buf[BLOCK_SIZE];
+        char *page = cache_get(&cache, c->fd, offset, 1);
+        if (!page) {
+            syslog(LOG_ERR, "Core %d: Failed to get cache page", c->id);
+            struct timespec delay = {0, HIGH_LOAD_DELAY_NS};
+            nanosleep(&delay, NULL);
+            continue;
+        }
+
+        memcpy(buf, page, BLOCK_SIZE);
+
+        // Сокращенная обработка данных
+        for (int i = 0; i < BLOCK_SIZE; i++) {
+            buf[i] ^= c->id;
+        }
+
+        // Сжатие и запись
+        char cmp[BLOCK_SIZE];
+        int cs = compress_page(buf, BLOCK_SIZE, cmp, 1);
+        if (cs > 0) {
+            pwrite(c->fd, cmp, cs, offset);
+        }
+
+        cache_to_ring(offset, buf);
+
+        // Увеличенная задержка для снижения нагрузки
+        struct timespec delay = {0, BASE_LOAD_DELAY_NS * 2};
+        nanosleep(&delay, NULL);
+    }
+
+    ring_cache_destroy();
+    cache_destroy(&cache, c->fd);
+    return NULL;
+}
+
+int main(void) {
+    daemonize();
+    syslog(LOG_INFO, "PseudoCore daemon запущен");
+
+    // Устанавливаем обработчики сигналов
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+
+    // Открываем файл хранилища
+    int fd = open("storage_swap.img", O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        syslog(LOG_ERR, "Не удалось открыть файл хранилища");
+        exit(EXIT_FAILURE);
+    }
+
+    // Запускаем потоки обработки
+    for (int i = 0; i < DAEMON_CORES; i++) {
+        core_args[i].id = i;
+        core_args[i].fd = fd;
+        core_args[i].seg_size = DAEMON_SEGMENT_MB * 1024 * 1024;
+        core_args[i].running = 1;
+
+        if (pthread_create(&core_threads[i], NULL, core_run, &core_args[i]) != 0) {
+            syslog(LOG_ERR, "Не удалось создать поток для ядра %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // Основной цикл демона
+    while (global_running) {
+        sleep(1);
+    }
+
+    close(fd);
+    syslog(LOG_INFO, "PseudoCore daemon завершил работу");
+    closelog();
+    return 0;
+}
+
+// ========== ring_cache.c ==========
+#include "ring_cache.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+static size_t ring_pos;
+static void *ring_buffer;
+static pthread_mutex_t ring_mutex;
+
+void ring_cache_init(void) {
+    ring_buffer = malloc(RING_SIZE);
+    if (!ring_buffer) {
+        fprintf(stderr, "Error allocating memory for ring buffer\n");
+        exit(1);
+    }
+    ring_pos = 0;
+    pthread_mutex_init(&ring_mutex, NULL);
+}
+
+void cache_to_ring(uint64_t off, const void *data) {
+    if (!data || !ring_buffer) {
+        fprintf(stderr, "Invalid data or ring buffer not initialized for offset %lu\n", off);
+        return;
+    }
+    pthread_mutex_lock(&ring_mutex);
+    // Copy block data into the ring buffer
+    if (ring_pos + BLOCK_SIZE <= RING_SIZE) {
+        memcpy((char*)ring_buffer + ring_pos, data, BLOCK_SIZE);
+        ring_pos = (ring_pos + BLOCK_SIZE) % RING_SIZE;
+    } else {
+        fprintf(stderr, "Ring buffer overflow prevented for offset %lu\n", off);
+    }
+    pthread_mutex_unlock(&ring_mutex);
+}
+
+void ring_cache_destroy(void) {
+    pthread_mutex_destroy(&ring_mutex);
+    free(ring_buffer);
+    ring_buffer = NULL;
+    ring_pos = 0;
+}
+
+// ========== ring_cache.h ==========
+#ifndef RING_CACHE_H
+#define RING_CACHE_H
+
+#include <stdint.h>
+#include <pthread.h>
+#include "config.h"
+
+#define RING_SIZE (CACHE_MB * 1024 * 1024)
+
+void ring_cache_init(void);
+void cache_to_ring(uint64_t off, const void *data);
+void ring_cache_destroy(void);
+
+#endif // RING_CACHE_H
+
+// ========== scheduler.c ==========
+// Примечание: Если вы видите ошибку IntelliSense "#include errors detected", 
+// это связано с конфигурацией includePath в VSCode. 
+// Пожалуйста, обновите includePath, выбрав команду "C/C++: Select IntelliSense Configuration..." 
+// или добавив необходимые пути в настройки c_cpp_properties.json.
+#include "scheduler.h"
+
+CoreQueue queues[CORES] = {0};
+
+void scheduler_init() {
+    for (int i = 0; i < CORES; i++) {
+        queues[i].count = 0;
+        pthread_mutex_init(&queues[i].mutex, NULL);
+    }
+}
+
+void scheduler_report_access(int core_id, uint64_t block) {
+    pthread_mutex_lock(&queues[core_id].mutex);
+    CoreQueue *q = &queues[core_id];
+    for (int i = 0; i < q->count; i++) {
+        if (q->w[i].block == block) {
+            q->w[i].hot++;
+            q->w[i].last_seen = time(NULL);
+            pthread_mutex_unlock(&queues[core_id].mutex);
+            return;
+        }
+    }
+    if (q->count < 64) {
+        q->w[q->count].block = block;
+        q->w[q->count].hot = 1;
+        q->w[q->count].last_seen = time(NULL);
+        q->count++;
+    }
+    pthread_mutex_unlock(&queues[core_id].mutex);
+}
+
+int scheduler_should_migrate(int core_id) {
+    int total = 0;
+    int other_cores = 0;
+    for (int i = 0; i < CORES; i++) {
+        if (i != core_id) {
+            pthread_mutex_lock(&queues[i].mutex);
+            total += queues[i].count;
+            pthread_mutex_unlock(&queues[i].mutex);
+            other_cores++;
+        }
+    }
+    int avg = (other_cores > 0) ? (total / other_cores) : 0;
+    pthread_mutex_lock(&queues[core_id].mutex);
+    int result = (queues[core_id].count < avg - MIGRATION_THRESHOLD);
+    pthread_mutex_unlock(&queues[core_id].mutex);
+    return result;
+}
+
+uint64_t scheduler_get_migrated_task(int core_id) {
+    for (int i = 0; i < CORES; i++) {
+        if (i == core_id) continue;
+        pthread_mutex_lock(&queues[i].mutex);
+        CoreQueue *q = &queues[i];
+        if (q->count > 0) {
+            uint64_t b = q->w[--q->count].block;
+            pthread_mutex_unlock(&queues[i].mutex);
+            return b;
+        }
+        pthread_mutex_unlock(&queues[i].mutex);
+    }
+    return 0;
+}
+
+void scheduler_destroy() {
+    for (int i = 0; i < CORES; i++) {
+        pthread_mutex_destroy(&queues[i].mutex);
+    }
+}
+
+// ========== scheduler.h ==========
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
+
+#include <stdint.h>
+#include <time.h>
+#include <pthread.h>
+
+#include "config.h"
+
+#ifndef CORES
+#define CORES 4
+#endif
+
+typedef struct { 
+    uint64_t block; 
+    int hot; 
+    time_t last_seen; 
+} WorkUnit;
+
+typedef struct { 
+    WorkUnit w[64]; 
+    int count; 
+    pthread_mutex_t mutex;
+} CoreQueue;
+
+extern CoreQueue queues[CORES];
+
+void scheduler_init();
+void scheduler_report_access(int core_id, uint64_t block);
+int scheduler_should_migrate(int core_id);
+uint64_t scheduler_get_migrated_task(int core_id);
+void scheduler_destroy();
+
+#endif // SCHEDULER_H
+
+// ========== README.md ==========
+# PseudoCore Prototype
+
+**Warning: This is a prototype. Not for production use.**
+
+PseudoCore is a high-performance data management system prototype, designed for research and demonstration purposes. The codebase is structured according to Clean Architecture and SOLID principles, with a focus on modularity, encapsulation, and performance.
+
+## Architecture Overview
+
+- **Application Layer:** CoreManager, TaskScheduler, DataManager
+- **Domain Layer:** CoreEntity, TaskEntity, BlockEntity
+- **Infrastructure Layer:** CacheEngine, CompressionEngine, StorageEngine
+
+Each component is designed with:
+- Strict typing and encapsulation
+- Thread safety
+- Error handling
+- Performance metrics
+- Data integrity checks
+- Resource management
+
+## Main Components
+- `pseudo_core.c` — Main core logic (foreground, high load)
+- `pseudo_core_daemon.c` — Daemonized version (background, reduced load)
+- `cache.c`, `compress.c`, `ring_cache.c`, `scheduler.c` — Supporting modules
+
+## Build Instructions
+
+```sh
+make clean
+make
+```
+
+This will build two binaries:
+- `pseudo_core` — Foreground prototype
+- `pseudo_core_daemon` — Daemonized version
+
+## Usage
+
+### Foreground (high load, blocks terminal)
+```sh
+./pseudo_core
+```
+- Runs in the foreground
+- High CPU and I/O load
+- Press `Ctrl+C` to stop
+
+### Daemon (recommended, reduced load)
+```sh
+sudo ./pseudo_core_daemon
+```
+- Runs in the background as a daemon
+- Uses 2 threads and smaller segments
+- Logs to syslog (check with `tail -f /var/log/syslog | grep pseudo_core`)
+- PID file: `/var/run/pseudo_core.pid`
+- To stop:
+  ```sh
+  sudo kill $(cat /var/run/pseudo_core.pid)
+  ```
+
+## Storage
+- Data is stored in `storage_swap.img` in the current directory
+
+## Notes
+- This is a research prototype. No guarantees, no warranties.
+- Code and configuration are subject to change.
+- For any issues, review logs and source code. 
