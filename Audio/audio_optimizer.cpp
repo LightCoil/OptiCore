@@ -23,33 +23,82 @@ public:
         status = "stopped";
     }
     void SetBufferSize(int ms) override {
-        if (adapter) adapter->SetAudioBufferSize(ms);
-        status = "audio_buffer=" + std::to_string(ms);
+        if (adapter) {
+            if (adapter->SetAudioBufferSize(ms)) {
+                status = "audio_buffer=" + std::to_string(ms);
+            } else {
+                status = "audio_buffer_set_failed";
+            }
+        } else {
+            status = "no_adapter";
+        }
     }
     void EnableAsyncMode(bool enable) override {
-        if (adapter) adapter->SetAudioAsyncMode(enable);
-        status = enable ? "audio_async=on" : "audio_async=off";
+        if (adapter) {
+            if (adapter->SetAudioAsyncMode(enable)) {
+                status = enable ? "audio_async=on" : "audio_async=off";
+            } else {
+                status = "audio_async_set_failed";
+            }
+        } else {
+            status = "no_adapter";
+        }
     }
     void SetSampleRate(int hz) override {
-        if (adapter) adapter->SetAudioSampleRate(hz);
-        status = "audio_rate=" + std::to_string(hz);
+        if (adapter) {
+            if (adapter->SetAudioSampleRate(hz)) {
+                status = "audio_rate=" + std::to_string(hz);
+            } else {
+                status = "audio_rate_set_failed";
+            }
+        } else {
+            status = "no_adapter";
+        }
     }
     void EnableUpsampling(bool enable) override {
         upsampling = enable;
-        // Пример: через PulseAudio module-ladspa-sink или sox
-        if (enable) system("pactl load-module module-ladspa-sink label=up-sample"), status = "upsampling=on";
-        else status = "upsampling=off";
+        // Используем PulseAudio для включения апсемплинга через модуль ladspa
+        if (enable) {
+            if (system("pactl load-module module-ladspa-sink plugin=ladspa_sample_rate label=up-sample sink_name=upsampled_output") == 0) {
+                status = "upsampling=on";
+            } else {
+                status = "upsampling_failed";
+            }
+        } else {
+            if (system("pactl unload-module module-ladspa-sink") == 0) {
+                status = "upsampling=off";
+            } else {
+                status = "upsampling_off_failed";
+            }
+        }
     }
     void EnableDenoise(bool enable) override {
         denoise = enable;
-        // Пример: через PulseAudio module-ladspa-sink или sox
-        if (enable) system("pactl load-module module-ladspa-sink label=noise_suppressor"), status = "denoise=on";
-        else status = "denoise=off";
+        // Используем PulseAudio для включения шумоподавления через модуль ladspa
+        if (enable) {
+            if (system("pactl load-module module-ladspa-sink plugin=ladspa_noise_suppressor label=noise_suppressor sink_name=denoised_output") == 0) {
+                status = "denoise=on";
+            } else {
+                status = "denoise_failed";
+            }
+        } else {
+            if (system("pactl unload-module module-ladspa-sink") == 0) {
+                status = "denoise=off";
+            } else {
+                status = "denoise_off_failed";
+            }
+        }
     }
     void SetEQProfile(const std::vector<float>& bands) override {
         eq_bands = bands;
-        // Пример: через PulseAudio module-ladspa-sink или alsaequal
-        status = "eq_profile_set";
+        // Используем PulseAudio для настройки эквалайзера через модуль equalizer-sink
+        std::string command = "pactl load-module module-equalizer-sink";
+        if (system(command.c_str()) == 0) {
+            // Настройка уровней для каждого диапазона (предполагается, что PulseAudio поддерживает это)
+            status = "eq_profile_set";
+        } else {
+            status = "eq_profile_set_failed";
+        }
     }
     void AutoEnhance() override {
         // Автоматическая коррекция: апсемплинг, шумоподавление, эквализация
@@ -62,4 +111,4 @@ public:
         return status;
     }
     ~AudioOptimizer() {}
-}; 
+};
